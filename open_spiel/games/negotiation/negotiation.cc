@@ -55,7 +55,14 @@ const GameType kGameType{
      {"num_items", GameParameter(kDefaultNumItems)},
      {"num_symbols", GameParameter(kDefaultNumSymbols)},
      {"rng_seed", GameParameter(kDefaultSeed)},
-     {"utterance_dim", GameParameter(kDefaultUtteranceDim)}}};
+     {"utterance_dim", GameParameter(kDefaultUtteranceDim)},
+     {"min_quantity", GameParameter(kDefaultMinQuantity)},
+     {"max_quantity", GameParameter(kDefaultMaxQuantity)},
+     {"min_value", GameParameter(kDefaultMinValue)},
+     {"max_value", GameParameter(kDefaultMaxValue)},
+     {"quantity_mean", GameParameter(kDefaultQuantityMean)},
+     {"max_rounds", GameParameter(kDefaultMaxRounds)},
+     {"discount", GameParameter(kDefaultDiscount)}}};
 
 static std::shared_ptr<const Game> Factory(const GameParameters& params) {
   return std::shared_ptr<const Game>(new NegotiationGame(params));
@@ -80,23 +87,28 @@ std::string NegotiationState::ActionToString(Player player,
                                              Action move_id) const {
   if (player == kChancePlayerId) {
     return absl::StrCat("chance outcome ", move_id);
-  } else {
-    std::string action_string = "";
-    if (turn_type_ == TurnType::kProposal) {
-      if (move_id == parent_game_.NumDistinctProposals() - 1) {
-        absl::StrAppend(&action_string, "Proposal: Agreement reached!");
-      } else {
-        std::vector<int> proposal = DecodeProposal(move_id);
-        std::string prop_str = absl::StrJoin(proposal, ", ");
-        absl::StrAppend(&action_string, "Proposal: [", prop_str, "]");
-      }
-    } else {
-      std::vector<int> utterance = DecodeUtterance(move_id);
-      std::string utt_str = absl::StrJoin(utterance, ", ");
-      absl::StrAppend(&action_string, ", Utterance: [", utt_str, "]");
-    }
-    return action_string;
   }
+  
+  // Check if this is a walk away action
+  if (move_id == parent_game_.NumDistinctActions() - 1) {
+    return absl::StrCat("Walk away (get ", walk_away_values_[player], " points)");
+  }
+  
+  std::string action_string = "";
+  if (turn_type_ == TurnType::kProposal) {
+    if (move_id == parent_game_.NumDistinctProposals() - 1) {
+      absl::StrAppend(&action_string, "Proposal: Agreement reached!");
+    } else {
+      std::vector<int> proposal = DecodeProposal(move_id);
+      std::string prop_str = absl::StrJoin(proposal, ", ");
+      absl::StrAppend(&action_string, "Proposal: [", prop_str, "]");
+    }
+  } else {
+    std::vector<int> utterance = DecodeUtterance(move_id);
+    std::string utt_str = absl::StrJoin(utterance, ", ");
+    absl::StrAppend(&action_string, ", Utterance: [", utt_str, "]");
+  }
+  return action_string;
 }
 
 bool NegotiationState::IsTerminal() const {
@@ -113,16 +125,45 @@ std::vector<double> NegotiationState::Returns() const {
     return std::vector<double>(num_players_, 0.0);
   }
 
+  // Check if the last action was a walk away action
+  if (walk_away_) {
+    std::vector<double> returns;
+    returns.reserve(walk_away_values_.size());
+    for (int value : walk_away_values_) {
+      returns.push_back(static_cast<double>(value));
+    }
+    // Apply discount based on complete rounds
+    if (num_steps_ > 2) {
+      // Calculate complete rounds - it should be (num_steps_ - 2) / 2 integer division
+      int complete_rounds = (num_steps_ - 2) / 2;  // Integer division, floors the result
+      double discount = std::pow(parent_game_.discount(), complete_rounds);
+      for (int i = 0; i < num_players_; ++i) {
+        returns[i] *= discount;
+      }
+    }
+    return returns;
+  }
+
+  // Calculate rewards from accepted proposal
   int proposing_player = proposals_.size() % 2 == 1 ? 0 : 1;
   int other_player = 1 - proposing_player;
   const std::vector<int>& final_proposal = proposals_.back();
 
-  std::vector<double> returns(num_players_, 0.0);
-  for (int j = 0; j < num_items_; ++j) {
-    returns[proposing_player] +=
-        agent_utils_[proposing_player][j] * final_proposal[j];
-    returns[other_player] +=
-        agent_utils_[other_player][j] * (item_pool_[j] - final_proposal[j]);
+  // Calculate utilities for both players
+  std::vector<double> returns(num_players_);
+  for (int i = 0; i < num_items_; ++i) {
+    returns[proposing_player] += final_proposal[i] * agent_utils_[proposing_player][i];
+    returns[other_player] += (item_pool_[i] - final_proposal[i]) * agent_utils_[other_player][i];
+  }
+
+  // Apply discount based on complete rounds
+  if (num_steps_ > 2) {
+    // Calculate complete rounds - it should be (num_steps_ - 2) / 2 integer division
+    int complete_rounds = (num_steps_ - 2) / 2;  // Integer division, floors the result
+    double discount = std::pow(parent_game_.discount(), complete_rounds);
+    for (int i = 0; i < num_players_; ++i) {
+      returns[i] *= discount;
+    }
   }
 
   return returns;
@@ -145,6 +186,9 @@ std::string NegotiationState::ObservationString(Player player) const {
                     "\n");
   }
 
+  // Add walk away value to observation
+  absl::StrAppend(&str, "Walk away value: ", walk_away_values_[player], "\n");
+
   absl::StrAppend(&str, "Current player: ", CurrentPlayer(), "\n");
   absl::StrAppend(&str, "Turn Type: ", TurnTypeToString(turn_type_), "\n");
 
@@ -161,24 +205,32 @@ std::string NegotiationState::ObservationString(Player player) const {
   return str;
 }
 
-// 1D vector with shape:
-//   - Current player: kNumPlayers bits
-//   - Current turn type: 2 bits
-//   - Terminal status: 2 bits: (Terminal? and Agreement reached?)
-//   - Context:
-//     - item pool      (num_items * (max_quantity + 1) bits)
-//     - my utilities   (num_items * (max_value + 1) bits)
-//   - Last proposal:   (num_items * (max_quantity + 1) bits)
-// If utterances are enabled, another:
-//   - Last utterance:  (utterance_dim * num_symbols) bits)
+// New structure:
+// [Current player (2) | Turn type (2) | Terminal status (2) | 
+//  Round number (1) | Base discount factor (1) | Current round discount (1) | 
+//  Item pool (num_items) | Utilities (num_items) | 
+//  Walk away value (1) | // Only include the observing player's walk away value
+//  Proposal history (max_rounds * 2 * num_items)]
 std::vector<int> NegotiationGame::ObservationTensorShape() const {
-  return {kNumPlayers + 2 + 2 + (num_items_ * (kMaxQuantity + 1)) +
-          (num_items_ * (kMaxValue + 1)) + (num_items_ * (kMaxQuantity + 1)) +
-          (enable_utterances_ ? utterance_dim_ * num_symbols_ : 0)};
+  // New structure:
+  // [Current player (2) | Turn type (2) | Terminal status (2) | 
+  //  Round number (1) | Base discount factor (1) | Current round discount (1) | 
+  //  Item pool (num_items) | Utilities (num_items) | 
+  //  Walk away value (1) | // Only include the observing player's walk away value
+  //  Proposal history (max_rounds * 2 * num_items)]
+  
+  // Calculate max_steps based on max_rounds
+  int max_steps = max_rounds_ * 2;
+  
+  return {kNumPlayers + 2 + 2 + 
+          1 + 1 + 1 + 
+          num_items_ + num_items_ + 
+          1 +  // Only include the observing player's walk away value
+          max_steps * num_items_};
 }
 
 void NegotiationState::ObservationTensor(Player player,
-                                         absl::Span<float> values) const {
+                                       absl::Span<float> values) const {
   SPIEL_CHECK_GE(player, 0);
   SPIEL_CHECK_LT(player, num_players_);
 
@@ -190,25 +242,15 @@ void NegotiationState::ObservationTensor(Player player,
     return;
   }
 
-  // 1D vector with shape:
-  //   - Current player: 2 bits
-  //   - Turn type: 2 bits
-  //   - Terminal status: 2 bits: (Terminal? and Agreement reached?)
-  //   - Context:
-  //     - item pool      (num_items * (max_quantity + 1) bits)
-  //     - my utilities   (num_items * (max_value + 1) bits)
-  //   - Last proposal:   (num_items * (max_quantity + 1) bits)
-  // If utterances are enabled, another:
-  //   - Last utterance:  (utterance_dim * num_symbols) bits)
-
-  // Current player.
   int offset = 0;
+
+  // Current player - still using one-hot encoding (2 values)
   if (!IsTerminal()) {
     values[offset + CurrentPlayer()] = 1;
   }
   offset += kNumPlayers;
 
-  // Current turn type.
+  // Current turn type - still using one-hot encoding (2 values)
   if (turn_type_ == TurnType::kProposal) {
     values[offset] = 1;
   } else {
@@ -216,46 +258,60 @@ void NegotiationState::ObservationTensor(Player player,
   }
   offset += 2;
 
-  // Terminal status: 2 bits
+  // Terminal status - still using one-hot encoding (2 values)
   values[offset] = IsTerminal() ? 1 : 0;
   values[offset + 1] = agreement_reached_ ? 1 : 0;
   offset += 2;
 
-  // Item pool.
-  for (int item = 0; item < num_items_; ++item) {
-    values[offset + item_pool_[item]] = 1;
-    offset += kMaxQuantity + 1;
-  }
+  // Current round number (1 value)
+  int current_round = (num_steps_ > 0) ? (num_steps_ - 1) / 2 : 0;
+  values[offset] = static_cast<float>(current_round);
+  offset += 1;
 
-  // Utilities.
-  for (int item = 0; item < num_items_; ++item) {
-    values[offset + agent_utils_[player][item]] = 1;
-    offset += kMaxValue + 1;
+  // Base discount factor of the game (1 value)
+  values[offset] = static_cast<float>(parent_game_.discount());
+  offset += 1;
+  
+  // Current round's applied discount factor (1 value)
+  double current_discount = 1.0;
+  if (num_steps_ > 2) {
+    int complete_rounds = (num_steps_ - 2) / 2;
+    current_discount = std::pow(parent_game_.discount(), complete_rounds);
   }
+  // Ensure the discount factor is stored properly as a float
+  values[offset] = static_cast<float>(current_discount);
+  offset += 1;
 
-  // Last proposal.
-  if (!proposals_.empty()) {
-    for (int item = 0; item < num_items_; ++item) {
-      values[offset + proposals_.back()[item]] = 1;
-      offset += kMaxQuantity + 1;
+  // Item pool - direct values (num_items values)
+  for (int i = 0; i < num_items_; ++i) {
+    values[offset + i] = static_cast<float>(item_pool_[i]);
+  }
+  offset += num_items_;
+
+  // Player utilities - direct values (num_items values)
+  for (int i = 0; i < num_items_; ++i) {
+    values[offset + i] = static_cast<float>(agent_utils_[player][i]);
+  }
+  offset += num_items_;
+
+  // Walk away value for the observing player only (1 value)
+  values[offset] = static_cast<float>(walk_away_values_[player]);
+  offset += 1;
+
+  // Proposal history (max_steps_ * num_items values)
+  // Initialize all to -1 (indicating no proposal)
+  for (int i = 0; i < max_steps_ * num_items_; ++i) {
+    values[offset + i] = -1;
+  }
+  
+  // Fill in proposals that have been made
+  for (int p = 0; p < proposals_.size() && p < max_steps_; ++p) {
+    for (int i = 0; i < num_items_; ++i) {
+      values[offset + p * num_items_ + i] = static_cast<float>(proposals_[p][i]);
     }
-  } else {
-    offset += num_items_ * (kMaxQuantity + 1);
   }
-
-  // Last utterance.
-  if (enable_utterances_) {
-    if (!utterances_.empty()) {
-      for (int dim = 0; dim < utterance_dim_; ++dim) {
-        values[offset + utterances_.back()[dim]] = 1;
-        offset += num_symbols_;
-      }
-    } else {
-      offset += utterance_dim_ * num_symbols_;
-    }
-  }
-
-  SPIEL_CHECK_EQ(offset, values.size());
+  
+  SPIEL_CHECK_EQ(offset + max_steps_ * num_items_, values.size());
 }
 
 NegotiationState::NegotiationState(std::shared_ptr<const Game> game)
@@ -271,10 +327,12 @@ NegotiationState::NegotiationState(std::shared_ptr<const Game> game)
       agreement_reached_(false),
       cur_player_(kChancePlayerId),
       turn_type_(TurnType::kProposal),
+      discount_(1.0),  // Initialize discount to 1.0
       item_pool_({}),
       agent_utils_({}),
       proposals_({}),
-      utterances_({}) {}
+      utterances_({}),
+      walk_away_values_({}) {}
 
 int NegotiationState::CurrentPlayer() const {
   return IsTerminal() ? kTerminalPlayerId : cur_player_;
@@ -288,70 +346,115 @@ int NegotiationState::CurrentPlayer() const {
 // that there is at least one item with non-zero utility), represented as a
 // vector u_j \in {0...10}^3".
 void NegotiationState::DetermineItemPoolAndUtilities() {
-  // Generate max number of rounds (max number of steps for the episode): we
-  // sample N between 4 and 10 at the start of each episode, according to a
-  // truncated Poissondistribution with mean 7, as done in the Cao et al. '18
-  // paper.
-  max_steps_ = -1;
-  absl::poisson_distribution<int> steps_dist(7.0);
-  while (!(max_steps_ >= 4 && max_steps_ <= 10)) {
-    max_steps_ = steps_dist(*parent_game_.RNG());
+  // Clear existing values
+  item_pool_.clear();
+  agent_utils_.clear();
+  walk_away_values_.clear();
+
+  // Use the configured max_rounds if available, otherwise sample it
+  if (parent_game_.MaxRounds() > 0) {
+    // Set directly from the parameter
+    max_steps_ = parent_game_.MaxRounds() * 2;  // Each round has 2 steps (player 0, player 1)
+  } else {
+    // Generate max number of rounds (max number of steps for the episode): we
+    // sample N between 4 and 10 at the start of each episode, according to a
+    // truncated Poissondistribution with mean 7, as done in the Cao et al. '18
+    // paper.
+    max_steps_ = -1;
+    absl::poisson_distribution<int> steps_dist(7.0);
+    while (!(max_steps_ >= 4 && max_steps_ <= 10)) {
+      max_steps_ = steps_dist(*parent_game_.RNG());
+    }
   }
 
-  // Generate the pool of items.
-  absl::uniform_int_distribution<int> quantity_dist(0, kMaxQuantity);
+  // Generate the pool of items using Poisson distribution with configurable mean
+  absl::poisson_distribution<int> quantity_dist(parent_game_.QuantityMean());
   for (int i = 0; i < num_items_; ++i) {
-    item_pool_.push_back(quantity_dist(*parent_game_.RNG()));
+    // Generate the quantity with Poisson distribution without clamping
+    int quantity = quantity_dist(*parent_game_.RNG());
+    item_pool_.push_back(quantity);
   }
 
   // Generate agent utilities.
-  absl::uniform_int_distribution<int> util_dist(0, kMaxValue);
+  absl::uniform_int_distribution<int> util_dist(parent_game_.MinValue(), parent_game_.MaxValue());
   for (int i = 0; i < num_players_; ++i) {
     agent_utils_.push_back({});
     int sum_util = 0;
     while (sum_util == 0) {
+      agent_utils_[i].clear();
       for (int j = 0; j < num_items_; ++j) {
         agent_utils_[i].push_back(util_dist(*parent_game_.RNG()));
         sum_util += agent_utils_[i].back();
       }
     }
   }
+
+  // Generate walk away values
+  walk_away_values_.resize(num_players_);
+  for (int i = 0; i < num_players_; ++i) {
+    // Calculate maximum possible utility for this player
+    int max_utility = 0;
+    for (int j = 0; j < num_items_; ++j) {
+      max_utility += agent_utils_[i][j] * item_pool_[j];
+    }
+    // Generate random walk away value between 1 and max_utility
+    if (max_utility > 1) {
+      absl::uniform_int_distribution<int> walk_away_dist(1, max_utility);
+      walk_away_values_[i] = walk_away_dist(*parent_game_.RNG());
+    } else {
+      walk_away_values_[i] = 1;  // If max_utility is 1, just use 1
+    }
+  }
 }
 
 void NegotiationState::InitializeEpisode() {
+  num_steps_ = 0;
+  agreement_reached_ = false;
+  walk_away_ = false;  // Reset walk away flag
   cur_player_ = 0;
   turn_type_ = TurnType::kProposal;
+  proposals_.clear();
+  utterances_.clear();
+  
+  // Generate new item pool and utilities
+  DetermineItemPoolAndUtilities();
 }
 
 void NegotiationState::DoApplyAction(Action move_id) {
   if (IsChanceNode()) {
     DetermineItemPoolAndUtilities();
-    InitializeEpisode();
+    cur_player_ = 0;
+    turn_type_ = TurnType::kProposal;
   } else {
-    if (turn_type_ == TurnType::kProposal) {
-      if (move_id == parent_game_.NumDistinctProposals() - 1) {
-        // Agreement!
-        agreement_reached_ = true;
+    // Check if this is a walk away action
+    if (move_id == parent_game_.NumDistinctActions() - 1) {
+      walk_away_ = true;
+      agreement_reached_ = true;
+    } else if (move_id == parent_game_.NumDistinctProposals() - 1) {
+      walk_away_ = false;  // Explicitly set walk away to false for accept
+      agreement_reached_ = true;
+    } else {
+      if (turn_type_ == TurnType::kProposal) {
+        proposals_.push_back(DecodeProposal(move_id));
       } else {
-        std::vector<int> proposal = DecodeProposal(move_id);
-        proposals_.push_back(proposal);
+        utterances_.push_back(DecodeUtterance(move_id));
       }
+    }
 
+    // Switch players and turn types
+    if (turn_type_ == TurnType::kProposal) {
       if (enable_utterances_) {
-        // Note: do not move to next player yet.
         turn_type_ = TurnType::kUtterance;
       } else {
-        // Keep it at kProposal, but move to next player.
         cur_player_ = 1 - cur_player_;
+        turn_type_ = TurnType::kProposal;
       }
     } else {
-      SPIEL_CHECK_TRUE(enable_utterances_);
-      std::vector<int> utterance = DecodeUtterance(move_id);
-      utterances_.push_back(utterance);
-      turn_type_ = TurnType::kProposal;
       cur_player_ = 1 - cur_player_;
+      turn_type_ = TurnType::kProposal;
     }
   }
+  num_steps_++;  // Increment step counter
 }
 
 bool NegotiationState::NextProposal(std::vector<int>* proposal) const {
@@ -398,7 +501,7 @@ int NegotiationState::EncodeInteger(const std::vector<int>& container,
 Action NegotiationState::EncodeProposal(
     const std::vector<int>& proposal) const {
   SPIEL_CHECK_EQ(proposal.size(), num_items_);
-  return EncodeInteger(proposal, kMaxQuantity + 1);
+  return EncodeInteger(proposal, parent_game_.MaxQuantity() + 1);
 }
 
 Action NegotiationState::EncodeUtterance(
@@ -410,7 +513,7 @@ Action NegotiationState::EncodeUtterance(
 }
 
 std::vector<int> NegotiationState::DecodeProposal(int encoded_proposal) const {
-  return DecodeInteger(encoded_proposal, num_items_, kMaxQuantity + 1);
+  return DecodeInteger(encoded_proposal, num_items_, parent_game_.MaxQuantity() + 1);
 }
 
 std::vector<int> NegotiationState::DecodeUtterance(
@@ -440,6 +543,9 @@ std::vector<Action> NegotiationState::LegalActions() const {
       // Add the agreement action only if there's been at least one proposal.
       legal_actions.push_back(parent_game_.NumDistinctProposals() - 1);
     }
+
+    // Add walk away action
+    legal_actions.push_back(parent_game_.NumDistinctActions() - 1);
 
     return legal_actions;
   } else {
@@ -508,8 +614,22 @@ NegotiationGame::NegotiationGame(const GameParameters& params)
       utterance_dim_(
           ParameterValue<int>("utterance_dim", kDefaultUtteranceDim)),
       seed_(ParameterValue<int>("rng_seed", kDefaultSeed)),
-      legal_utterances_({}),
-      rng_(new std::mt19937(seed_ >= 0 ? seed_ : std::mt19937::default_seed)) {
+      discount_(ParameterValue<double>("discount", kDefaultDiscount)),
+      min_quantity_(ParameterValue<int>("min_quantity", kDefaultMinQuantity)),
+      max_quantity_(ParameterValue<int>("max_quantity", kDefaultMaxQuantity)),
+      min_value_(ParameterValue<int>("min_value", kDefaultMinValue)),
+      max_value_(ParameterValue<int>("max_value", kDefaultMaxValue)),
+      quantity_mean_(ParameterValue<double>("quantity_mean", kDefaultQuantityMean)),
+      max_rounds_(ParameterValue<int>("max_rounds", kDefaultMaxRounds)),
+      legal_utterances_({}) {
+  // Use a time-based random seed when none is provided
+  if (seed_ < 0) {
+    // Use current time as seed for true randomness when no seed is provided
+    rng_ = std::make_unique<std::mt19937>(std::random_device{}());
+  } else {
+    // Use the provided seed for deterministic behavior
+    rng_ = std::make_unique<std::mt19937>(seed_);
+  }
   ConstructLegalUtterances();
 }
 
@@ -537,17 +657,7 @@ int NegotiationGame::NumDistinctUtterances() const {
 int NegotiationGame::NumDistinctProposals() const {
   // Every slot can hold { 0, 1, ..., MaxQuantity }, and there is an extra
   // one at the end for the special "agreement reached" action.
-  return static_cast<int>(std::pow(kMaxQuantity + 1, num_items_)) + 1;
-}
-
-// See the header for an explanation of how these are encoded.
-int NegotiationGame::NumDistinctActions() const {
-  if (enable_utterances_) {
-    return NumDistinctProposals() + NumDistinctUtterances();
-  } else {
-    // Proposals are always possible.
-    return NumDistinctProposals();
-  }
+  return static_cast<int>(std::pow(max_quantity_ + 1, num_items_)) + 1;
 }
 
 std::string NegotiationState::Serialize() const {
@@ -621,6 +731,14 @@ void NegotiationGame::SetRNGState(const std::string& rng_state) const {
   if (rng_state.empty()) return;
   std::istringstream rng_stream(rng_state);
   rng_stream >> *rng_;
+}
+
+std::unique_ptr<State> NegotiationGame::NewInitialState() const {
+  // If a seed was provided, reset the RNG to ensure consistent game configurations
+  if (seed_ >= 0) {
+    rng_ = std::make_unique<std::mt19937>(seed_);
+  }
+  return std::unique_ptr<State>(new NegotiationState(shared_from_this()));
 }
 
 }  // namespace negotiation
