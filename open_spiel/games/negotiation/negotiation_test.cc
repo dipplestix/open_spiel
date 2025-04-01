@@ -47,6 +47,12 @@ void BasicNegotiationTests() {
   testing::RandomSimTest(
       *LoadGame("negotiation", {{"enable_proposals", GameParameter(false)}}),
       100);
+
+  // Try with discount factor
+  std::cout << "\nStarting discount factor test..." << std::endl;
+  testing::RandomSimTest(
+      *LoadGame("negotiation", {{"discount", GameParameter(0.9)}}),
+      100);
 }
 
 }  // namespace

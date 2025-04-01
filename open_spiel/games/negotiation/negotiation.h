@@ -50,6 +50,8 @@
 //                                 (default -1 = not set, seeded by clock)
 //     "utterance_dim"     int     dimensionality of the utterances, i.e. number
 //                                 of symbols per utterance (default = 3)
+//     "discount"          double  discount factor applied after turn 2
+//                                 (default = 1.0)
 
 namespace open_spiel {
 namespace negotiation {
@@ -58,12 +60,17 @@ inline constexpr bool kDefaultEnableProposals = true;
 inline constexpr bool kDefaultEnableUtterances = true;
 inline constexpr int kDefaultNumSymbols = 5;
 inline constexpr int kDefaultUtteranceDim = 3;
-inline constexpr int kMaxQuantity = 5;
-inline constexpr int kMaxValue = 10;
+inline constexpr int kDefaultMinQuantity = 0;
+inline constexpr int kDefaultMaxQuantity = 5;
+inline constexpr int kDefaultMinValue = 0;
+inline constexpr int kDefaultMaxValue = 10;
+inline constexpr double kDefaultQuantityMean = 3.0;
 inline constexpr int kMaxSteps = 10;
+inline constexpr int kDefaultMaxRounds = 5;  // Default max rounds
 inline constexpr int kNumPlayers = 2;
 inline constexpr int kDefaultNumItems = 3;
 inline constexpr int kDefaultSeed = -1;
+inline constexpr double kDefaultDiscount = 1.0;
 
 // The utterances and proposals are done in separate repeated turns by the same
 // agent. This enum is used to keep track what the type of turn it is.
@@ -99,6 +106,9 @@ class NegotiationState : public State {
   int MaxSteps() const { return max_steps_; }
   void SetMaxSteps(int max_steps) { max_steps_ = max_steps; }
   std::string Serialize() const override;
+  int WalkAwayValue(Player player) const { return walk_away_values_[player]; }
+  const std::vector<std::vector<int>>& Proposals() const { return proposals_; }
+  std::vector<int> DecodeProposal(int encoded_proposal) const;
 
  protected:
   void DoApplyAction(Action move_id) override;
@@ -120,7 +130,6 @@ class NegotiationState : public State {
   // at an offset of NumDistinctProposals().
   Action EncodeProposal(const std::vector<int>& proposal) const;
   Action EncodeUtterance(const std::vector<int>& utterance) const;
-  std::vector<int> DecodeProposal(int encoded_proposal) const;
   std::vector<int> DecodeUtterance(int encoded_utterance) const;
 
   std::vector<int> DecodeInteger(int encoded_value, int dimensions,
@@ -137,8 +146,10 @@ class NegotiationState : public State {
   int num_steps_;
   int max_steps_;
   bool agreement_reached_;
+  bool walk_away_;  // Track if the last action was a walk away
   Player cur_player_;
   TurnType turn_type_;
+  double discount_;
 
   // Current quantities of items 0, 1, 2..
   std::vector<int> item_pool_;
@@ -152,6 +163,9 @@ class NegotiationState : public State {
 
   // History of utterances.
   std::vector<std::vector<int>> utterances_;
+
+  // Walk away values for each player
+  std::vector<int> walk_away_values_;
 };
 
 class NegotiationGame : public Game {
@@ -159,10 +173,14 @@ class NegotiationGame : public Game {
   explicit NegotiationGame(const GameParameters& params);
   explicit NegotiationGame(const NegotiationGame& other);
 
-  int NumDistinctActions() const override;
-  std::unique_ptr<State> NewInitialState() const override {
-    return std::unique_ptr<State>(new NegotiationState(shared_from_this()));
+  int NumDistinctActions() const override {
+    if (enable_utterances_) {
+      return NumDistinctProposals() + NumDistinctUtterances() + 1;  // +1 for walk away
+    } else {
+      return NumDistinctProposals() + 1;  // +1 for walk away
+    }
   }
+  std::unique_ptr<State> NewInitialState() const override;
   int MaxChanceOutcomes() const override { return 1; }
 
   // There is arbitrarily chosen number to ensure the game is finite.
@@ -172,7 +190,7 @@ class NegotiationGame : public Game {
 
   int NumPlayers() const override { return kNumPlayers; }
   double MaxUtility() const override {
-    return kMaxQuantity * kMaxValue * num_items_;
+    return max_quantity_ * max_value_ * num_items_;
   }
   double MinUtility() const override { return -MaxUtility(); }
   std::vector<int> ObservationTensorShape() const override;
@@ -188,6 +206,12 @@ class NegotiationGame : public Game {
   int NumItems() const { return num_items_; }
   int NumSymbols() const { return num_symbols_; }
   int UtteranceDim() const { return utterance_dim_; }
+  int MinQuantity() const { return min_quantity_; }
+  int MaxQuantity() const { return max_quantity_; }
+  int MinValue() const { return min_value_; }
+  int MaxValue() const { return max_value_; }
+  double QuantityMean() const { return quantity_mean_; }
+  int MaxRounds() const { return max_rounds_; }
 
   int NumDistinctUtterances() const;
   int NumDistinctProposals() const;
@@ -195,6 +219,8 @@ class NegotiationGame : public Game {
   const std::vector<Action>& LegalUtterances() const {
     return legal_utterances_;
   }
+
+  double discount() const { return discount_; }
 
  private:
   void ConstructLegalUtterances();
@@ -205,6 +231,13 @@ class NegotiationGame : public Game {
   int num_symbols_;
   int utterance_dim_;
   int seed_;
+  double discount_;
+  int min_quantity_;
+  int max_quantity_;
+  int min_value_;
+  int max_value_;
+  double quantity_mean_;
+  int max_rounds_;
   std::vector<Action> legal_utterances_;
   mutable std::unique_ptr<std::mt19937> rng_;
 };
